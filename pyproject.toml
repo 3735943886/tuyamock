@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tuyamock"
+dynamic = ["version"]  # single source: src/tuyamock/__init__.py:__version__
+description = "Protocol-faithful mock of a Tuya local-protocol device, built on tinytuya primitives"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "tuyamock contributors" }]
+keywords = ["tuya", "tinytuya", "mock", "testing", "iot", "smart-home", "local-protocol"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Testing :: Mocking",
+    "Topic :: Home Automation",
+]
+dependencies = [
+    # The mock must reuse tinytuya's own packing/crypto primitives so that it
+    # stays an *independent* oracle: if the mock spoke a re-implemented dialect,
+    # validating another client against it would be circular.
+    "tinytuya>=1.13",
+]
+
+[project.urls]
+Homepage = "https://github.com/3735943886/tuyamock"
+Repository = "https://github.com/3735943886/tuyamock"
+Issues = "https://github.com/3735943886/tuyamock/issues"
+
+[project.optional-dependencies]
+test = ["pytest>=7.0"]
+
+[project.scripts]
+tuyamock = "tuyamock.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "tuyamock.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
