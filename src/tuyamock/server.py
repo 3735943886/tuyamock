@@ -36,18 +36,25 @@ class TuyaMockServer:
     """
 
     def __init__(self, config, host="127.0.0.1", port=6668, discovery=False,
-                 discovery_addr="127.0.0.1"):
+                 discovery_addr="127.0.0.1", idle_timeout=30.0):
         self.config = config
         self.host = host
         self.port = port
         self.discovery = discovery
         self.discovery_addr = discovery_addr
+        # Real Tuya devices drop a local TCP connection after ~30s with no inbound
+        # packet (this is why clients send heartbeats). Set to 0/None to disable.
+        self.idle_timeout = idle_timeout
         self.device = TuyaMockDevice(config)
         self._srv = None
         self._udp = None
         self._bcast_next = 0.0
         self._closed = False
         self.connections = 0  # total client connections accepted (observable)
+        # Current connection, shared with push() (other thread); guarded by the lock.
+        self._io_lock = threading.Lock()
+        self._client = None
+        self._session = None
 
     # -- lifecycle --------------------------------------------------------
 
@@ -66,6 +73,11 @@ class TuyaMockServer:
             self._udp.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         log.info("listening on %s:%d (v%s)", self.host, self.port, self.config.version)
         return self.port
+
+    @property
+    def has_client(self):
+        """Whether a client connection is currently held open."""
+        return self._client is not None
 
     def close(self):
         if self._closed:
@@ -120,6 +132,7 @@ class TuyaMockServer:
         client = None
         buffer = b""
         session = None
+        last_rx = 0.0  # time of last inbound packet, for the idle timeout
         try:
             while not self._closed:
                 rlist = [self._srv]
@@ -132,7 +145,21 @@ class TuyaMockServer:
                     # another thread to stop a background server).
                     break
 
-                self._maybe_broadcast(time.time())
+                now = time.time()
+                self._maybe_broadcast(now)
+
+                # Idle timeout: a real device drops the connection if it does not
+                # receive a packet for ~30s (hence client heartbeats).
+                if (client is not None and self.idle_timeout
+                        and now - last_rx > self.idle_timeout):
+                    log.info("client idle for >%.0fs, closing", self.idle_timeout)
+                    client.close()
+                    client, session = None, None
+                    self._set_current(None, None)
+                    served += 1
+                    if max_connections is not None and served >= max_connections:
+                        return served
+                    continue
 
                 # Service the existing client's data/disconnect BEFORE accepting a
                 # new connection. Tuya clients are non-persistent (a fresh connection
@@ -153,11 +180,13 @@ class TuyaMockServer:
                         client.close()
                         client = None
                         session = None
+                        self._set_current(None, None)
                         served += 1
                         log.info("client disconnected (%d served)", served)
                         if max_connections is not None and served >= max_connections:
                             return served
                     else:
+                        last_rx = now
                         buffer += data
                         frames, buffer = take_frames(buffer)
                         for frame in frames:
@@ -174,9 +203,15 @@ class TuyaMockServer:
                         # client); replace it.
                         client.close()
                     client = new_client
-                    client.setblocking(True)
+                    # A send timeout keeps a non-reading client (which never drains
+                    # our responses) from blocking the loop forever in sendall; the
+                    # blocked send raises and we drop the connection. recv is guarded
+                    # by select() so it never hits this.
+                    client.settimeout(self.idle_timeout or None)
                     buffer = b""
                     session = self.device.new_session()
+                    last_rx = now
+                    self._set_current(client, session)
                     self.connections += 1
                     log.info("client connected: %r", addr)
         except KeyboardInterrupt:
@@ -187,8 +222,15 @@ class TuyaMockServer:
                     client.close()
                 except OSError:
                     pass
+            self._set_current(None, None)
             self.close()
         return served
+
+    def _set_current(self, client, session):
+        """Publish the active connection so push() (another thread) can use it."""
+        with self._io_lock:
+            self._client = client
+            self._session = session
 
     def _handle_frame(self, client, session, frame):
         try:
@@ -197,9 +239,40 @@ class TuyaMockServer:
             log.warning("failed to decode frame (%d bytes): %s", len(frame), exc)
             return
         log.debug("recv cmd=0x%02x payload=%r", msg.cmd, msg.payload)
-        reply = session.handle(msg)
-        if reply is not None:
-            client.sendall(reply)
+        # Hold the I/O lock across handle()+sendall so a concurrent push() (other
+        # thread) cannot interleave bytes on the socket or race on session.seqno.
+        with self._io_lock:
+            reply = session.handle(msg)
+            if reply is not None:
+                try:
+                    client.sendall(reply)
+                except OSError as exc:
+                    # Client went away mid-exchange (e.g. a nowait command that
+                    # sends without reading, then closes). Not fatal: the next
+                    # recv/idle-check tears the connection down.
+                    log.debug("send failed, client likely gone: %s", exc)
+
+    def push(self, dps=None):
+        """Send an unsolicited STATUS update to the currently-connected client.
+
+        Emulates a device-initiated state report (what a monitor-style client
+        ``receive()``s). ``dps`` defaults to the full current state; pass a dict to
+        report only specific data points. Returns True if a frame was sent, False
+        if there is no ready connection. Thread-safe; call it from any thread.
+        """
+        with self._io_lock:
+            client, session = self._client, self._session
+            if client is None or session is None:
+                return False
+            frame = session.status_push(dps)
+            if frame is None:
+                return False
+            try:
+                client.sendall(frame)
+                return True
+            except OSError as exc:
+                log.debug("push failed, client likely gone: %s", exc)
+                return False
 
 
 class MockDevice:
@@ -224,7 +297,7 @@ class MockDevice:
     def __init__(self, local_key, version="3.5", dps=None, dev22=False,
                  host="127.0.0.1", port=0, gw_id="eb0123456789abcdefghij",
                  product_key="keydeadbeef12345", discovery=False,
-                 discovery_addr="127.0.0.1"):
+                 discovery_addr="127.0.0.1", idle_timeout=30.0):
         self.config = DeviceConfig(
             local_key=local_key, dps=dps, version=version, dev22=dev22,
             gw_id=gw_id, product_key=product_key,
@@ -232,6 +305,7 @@ class MockDevice:
         self.server = TuyaMockServer(
             self.config, host=host, port=port,
             discovery=discovery, discovery_addr=discovery_addr,
+            idle_timeout=idle_timeout,
         )
         self._thread = None
 
@@ -244,6 +318,19 @@ class MockDevice:
     def dps(self):
         """Live device data-point state (mutated by client set commands)."""
         return self.config.dps
+
+    @property
+    def connected(self):
+        """Whether a client connection is currently held open."""
+        return self.server.has_client
+
+    def push(self, dps=None):
+        """Push a device-initiated STATUS update to the connected client.
+
+        Lets a test simulate an asynchronous device update that a monitoring
+        client picks up via ``receive()``. Returns True if sent.
+        """
+        return self.server.push(dps)
 
     def start(self):
         """Bind and start serving in a daemon thread. Returns the bound port."""

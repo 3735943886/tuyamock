@@ -120,8 +120,18 @@ class Session:
         # key once negotiation finishes - mirroring the tinytuya client, which
         # only switches *after* sending FINISH.
         self.key = config.real_key
-        # Devices reply with a globally incrementing seqno, not a request echo.
+        # The device's own global seqno counter, used for v3.5 command responses
+        # and for device-initiated pushes on every version.
         self.seqno = 1
+        # Seqno of the request currently being handled; v3.1-3.4 responses echo it
+        # (tinytuya matches retcode on it for version < 3.5).
+        self.req_seqno = 0
+
+    def next_global_seqno(self):
+        """Allocate the next device-global seqno (v3.5 responses, async pushes)."""
+        s = self.seqno
+        self.seqno += 1
+        return s
 
     def session_nonce(self):
         """client_nonce XOR device_nonce (the basis for the session key)."""
@@ -207,9 +217,28 @@ class Session:
             log.warning("could not parse updatedps payload: %r", msg.payload)
         return self._status_response(msg.cmd, only=only)
 
+    def status_push(self, dps=None):
+        """Build an unsolicited STATUS frame (device-initiated update).
+
+        Returns packed bytes to send to a connected client, or None if no session
+        key is established yet. Used by the server's push() so a monitor-style
+        client can ``receive()`` device-initiated changes. Async pushes use the
+        device's global seqno on every version (there is no request to echo).
+        """
+        if self.profile.needs_session and self.session_key is None:
+            return None
+        reported = dict(self.config.dps) if dps is None else {str(k): v for k, v in dps.items()}
+        resp = {"protocol": 4, "t": int(time.time()), "data": {"dps": reported}}
+        body = self.profile.encrypt_payload(self, json.dumps(resp).encode("ascii"))
+        return self.profile.pack_response(
+            self, CT.STATUS, body, seqno=self.next_global_seqno()
+        )
+
     def handle(self, msg):
         """Dispatch one decoded client message, returning packed reply bytes or None."""
         cmd = msg.cmd
+        # v3.1-3.4 responses echo this; v3.5 ignores it (uses the global counter).
+        self.req_seqno = msg.seqno
         if cmd == CT.SESS_KEY_NEG_START:
             return self._handle_neg_start(msg)
         if cmd == CT.SESS_KEY_NEG_FINISH:

@@ -232,6 +232,33 @@ The device22 reject→reconnect handshake works against the mock: a single
 standard query, tinytuya detects device22, reconnects, and retries via
 `CONTROL_NEW`).
 
+## Connection lifecycle (heartbeat, idle timeout, monitor)
+
+The mock models how a real Tuya device manages its single local TCP connection:
+
+- **Idle timeout** — a real device drops the connection if it receives no packet
+  for ~30s, which is why clients send heartbeats. `MockDevice(idle_timeout=30.0)`
+  (default 30s; `0`/`None` disables). A heartbeat resets the timer.
+- **Heartbeats** — `HEART_BEAT` is answered with an empty-payload ack.
+- **nowait / send-only clients** — a client that fires `nowait` commands or raw
+  `send()`s without reading the reply will not crash or wedge the mock (the reply
+  is attempted and the dropped socket is cleaned up on the next loop).
+- **Device-initiated push (monitor)** — `mock.push(dps)` sends an asynchronous
+  `STATUS` update to the connected client, which a monitoring loop picks up via
+  `receive()`. tinytuya's `examples/monitor.py` pattern works against the mock;
+  see [`examples/monitor_demo.py`](examples/monitor_demo.py).
+
+```python
+with tuyamock.MockDevice(local_key="thisisarealkey00", version="3.5",
+                         dps={"20": "white"}) as mock:
+    # ... a monitoring tinytuya client is connected ...
+    mock.dps["20"] = "red"
+    mock.push({"20": "red"})       # client receives this via receive()
+```
+
+Response seqno is handled per the protocol: v3.1–3.4 echo the request seqno
+(so tinytuya pairs the reply's retcode), v3.5 uses a global incrementing seqno.
+
 ## Stateful device
 
 The mock keeps live dps state and responds to the full tinytuya client command
