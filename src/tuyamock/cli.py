@@ -6,7 +6,7 @@ import logging
 import signal
 import sys
 
-from .device import DeviceConfig, DEFAULT_DPS, SUPPORTED_VERSIONS
+from .device import DeviceConfig, DEFAULT_DPS, SEQNO_MODES, SUPPORTED_VERSIONS
 from .server import TuyaMockServer
 
 
@@ -69,6 +69,17 @@ def build_parser():
         help="Address used in/for the discovery beacon (default: 127.0.0.1).",
     )
     p.add_argument(
+        "--seqno-mode", default="faithful", choices=list(SEQNO_MODES),
+        help="How the device stamps response seqno. 'faithful' (default) matches "
+             "the tinytuya-expected convention; 'global'/'echo'/'zero' deliberately "
+             "misbehave to stress a client's robustness to inconsistent seqno.",
+    )
+    p.add_argument(
+        "--idle-timeout", type=float, default=30.0,
+        help="Drop a connection after this many seconds with no inbound packet "
+             "(default: 30; 0 disables). Real devices do this; clients heartbeat.",
+    )
+    p.add_argument(
         "--max-connections", type=int, default=None,
         help="Exit after serving this many client connections (default: run forever).",
     )
@@ -98,6 +109,7 @@ def main(argv=None):
             gw_id=args.gw_id,
             product_key=args.product_key,
             dev22=args.dev22,
+            seqno_mode=args.seqno_mode,
         )
     except ValueError as exc:
         print("error: %s" % exc, file=sys.stderr)
@@ -109,6 +121,7 @@ def main(argv=None):
         port=args.port,
         discovery=args.discovery,
         discovery_addr=args.discovery_addr,
+        idle_timeout=args.idle_timeout,
     )
 
     # Translate SIGTERM into KeyboardInterrupt so serve_forever() unwinds the

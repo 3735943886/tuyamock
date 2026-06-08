@@ -297,10 +297,11 @@ class MockDevice:
     def __init__(self, local_key, version="3.5", dps=None, dev22=False,
                  host="127.0.0.1", port=0, gw_id="eb0123456789abcdefghij",
                  product_key="keydeadbeef12345", discovery=False,
-                 discovery_addr="127.0.0.1", idle_timeout=30.0):
+                 discovery_addr="127.0.0.1", idle_timeout=30.0,
+                 seqno_mode="faithful"):
         self.config = DeviceConfig(
             local_key=local_key, dps=dps, version=version, dev22=dev22,
-            gw_id=gw_id, product_key=product_key,
+            gw_id=gw_id, product_key=product_key, seqno_mode=seqno_mode,
         )
         self.server = TuyaMockServer(
             self.config, host=host, port=port,

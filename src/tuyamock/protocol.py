@@ -114,8 +114,9 @@ class VersionProfile:
         payload = self._decrypt_payload(session, msg.cmd, msg.payload)
         return msg._replace(payload=payload)
 
-    def response_seqno(self, session):
-        """Seqno for a *command response*.
+    def default_response_seqno(self, session):
+        """The faithful seqno for a *command response* (config.seqno_mode override
+        is applied by Session.response_seqno, which calls this for "faithful").
 
         TINYTUYA-COUPLING (Layer 2): tinytuya's _get_retcode requires the response
         seqno to EQUAL the request seqno for version < 3.5 (only v3.5 uses a global
@@ -128,11 +129,11 @@ class VersionProfile:
     def pack_response(self, session, cmd, wire_payload, seqno=None):
         """Frame already-encoded ``wire_payload`` bytes into a device->client packet.
 
-        ``seqno`` defaults to :meth:`response_seqno` (a command reply); device
-        initiated pushes pass an explicit global seqno instead.
+        ``seqno`` defaults to the session's response seqno (which honours
+        config.seqno_mode); device-initiated pushes pass an explicit global seqno.
         """
         if seqno is None:
-            seqno = self.response_seqno(session)
+            seqno = session.response_seqno()
         # TINYTUYA-COUPLING (Layer 2: TuyaMessage field order + retcode asymmetry).
         # TuyaMessage is built POSITIONALLY as
         # (seqno, cmd, retcode, payload, crc, crc_good, prefix, iv); last field is
@@ -227,7 +228,7 @@ class V35Profile(VersionProfile):
     def framing_key(self, session):
         return session.key
 
-    def response_seqno(self, session):
+    def default_response_seqno(self, session):
         # v3.5 devices reply with a global incrementing seqno, not the request's.
         return session.next_global_seqno()
 

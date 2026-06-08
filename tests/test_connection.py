@@ -33,6 +33,43 @@ def test_response_seqno_pairs_retcode(version):
         assert d.cmd_retcode == 0, "retcode not paired (seqno mismatch) on v%s" % version
 
 
+@pytest.mark.parametrize("mode", ["global", "echo", "zero"])
+def test_seqno_mode_misbehaves_but_data_plane_survives(mode):
+    """seqno_mode lets the device deliberately mis-stamp the seqno so a client can
+    be stress-tested. A robust client still decodes dps correctly regardless."""
+    with tuyamock.MockDevice(local_key=KEY, version="3.3", dps={"1": True, "20": "white"},
+                             seqno_mode=mode) as mock:
+        d = client(mock.port, "3.3")
+        # Data plane is independent of seqno, so status() must still be correct.
+        assert d.status()["dps"]["20"] == "white"
+        d.set_value("20", "red")
+        assert d.status()["dps"]["20"] == "red"
+
+
+def test_seqno_mode_zero_breaks_retcode_pairing_on_v33():
+    """Concretely show the smell: on v3.3 a device seqno of 0 (never matching the
+    client's >=1) leaves tinytuya unable to pair the retcode, while v3.5 ignores
+    seqno entirely. Either way the data plane is unaffected."""
+    with tuyamock.MockDevice(local_key=KEY, version="3.3", dps={"1": True},
+                             seqno_mode="zero") as mock:
+        d = client(mock.port, "3.3")
+        assert d.status()["dps"]["1"] is True   # data still correct
+        assert d.cmd_retcode is None            # but retcode pairing is broken
+
+
+def test_seqno_mode_callable():
+    """A callable seqno_mode allows arbitrary custom schemes."""
+    with tuyamock.MockDevice(local_key=KEY, version="3.5", dps={"1": True},
+                             seqno_mode=lambda session: 4242) as mock:
+        d = client(mock.port, "3.5")
+        assert d.status()["dps"]["1"] is True  # still works
+
+
+def test_seqno_mode_invalid_rejected():
+    with pytest.raises(ValueError):
+        tuyamock.MockDevice(local_key=KEY, version="3.5", seqno_mode="bogus")
+
+
 def test_nowait_and_send_do_not_break_server():
     """A client that fires nowait/raw sends without reading the reply must not
     crash or wedge the mock (real devices reply regardless; the socket may close)."""

@@ -47,6 +47,15 @@ DEFAULT_DPS = {
 # keys on, device22 detection breaks silently.
 DATA_UNVALID = b"json obj data unvalid"
 
+# How the device assigns the seqno on a *command response*. Real devices are
+# inconsistent here (some echo the request seqno, some run a global counter, some
+# always send 0), and tinytuya is deliberately loose about pairing because of it.
+# "faithful" reproduces the tinytuya-expected convention (echo for <3.5, global
+# for v3.5); the others let you deliberately misbehave to stress a client's
+# robustness (it must not depend on seqno for correctness). A callable
+# (session) -> int is also accepted for custom schemes.
+SEQNO_MODES = ("faithful", "global", "echo", "zero")
+
 
 class DeviceConfig:
     """Static configuration of the emulated device (everything but per-connection state)."""
@@ -59,6 +68,7 @@ class DeviceConfig:
         gw_id="eb0123456789abcdefghij",
         product_key="keydeadbeef12345",
         dev22=False,
+        seqno_mode="faithful",
     ):
         if isinstance(local_key, str):
             local_key = local_key.encode("latin1")
@@ -77,11 +87,17 @@ class DeviceConfig:
                 "device22 is only emulated for versions %s, not %s"
                 % (", ".join(DEV22_VERSIONS), self.version)
             )
+        if not callable(seqno_mode) and seqno_mode not in SEQNO_MODES:
+            raise ValueError(
+                "seqno_mode must be one of %s or a callable(session)->int, not %r"
+                % (", ".join(SEQNO_MODES), seqno_mode)
+            )
         self.real_key = local_key
         self.dps = dict(dps) if dps is not None else dict(DEFAULT_DPS)
         self.gw_id = gw_id
         self.product_key = product_key
         self.dev22 = dev22
+        self.seqno_mode = seqno_mode
 
     def discovery_payload(self, ip="127.0.0.1"):
         """The JSON a device broadcasts over UDP for discovery."""
@@ -132,6 +148,25 @@ class Session:
         s = self.seqno
         self.seqno += 1
         return s
+
+    def response_seqno(self):
+        """The seqno to stamp on a command response, honouring config.seqno_mode.
+
+        "faithful" delegates to the per-version default (echo for <3.5, global for
+        v3.5); the other modes deliberately misbehave so a client can be tested for
+        robustness to inconsistent device seqno.
+        """
+        mode = self.config.seqno_mode
+        if callable(mode):
+            return int(mode(self))
+        if mode == "global":
+            return self.next_global_seqno()
+        if mode == "echo":
+            return self.req_seqno
+        if mode == "zero":
+            return 0
+        # "faithful"
+        return self.profile.default_response_seqno(self)
 
     def session_nonce(self):
         """client_nonce XOR device_nonce (the basis for the session key)."""

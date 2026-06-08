@@ -259,6 +259,24 @@ with tuyamock.MockDevice(local_key="thisisarealkey00", version="3.5",
 Response seqno is handled per the protocol: v3.1–3.4 echo the request seqno
 (so tinytuya pairs the reply's retcode), v3.5 uses a global incrementing seqno.
 
+### Misbehaving on purpose (`seqno_mode`)
+
+Real devices are inconsistent about seqno, so a robust client must not depend on
+it for correctness. `MockDevice(seqno_mode=...)` lets you deliberately misbehave
+to stress-test that:
+
+| mode | behaviour |
+|------|-----------|
+| `"faithful"` (default) | echo for v3.1–3.4, global for v3.5 (what real devices/tinytuya expect) |
+| `"global"` | always a global incrementing seqno |
+| `"echo"` | always echo the request seqno |
+| `"zero"` | always 0 |
+| `callable(session) -> int` | any custom scheme |
+
+The data plane is independent of seqno, so a correct client still decodes dps
+under any mode; only tinytuya's `cmd_retcode` pairing is affected. Also on the
+CLI: `--seqno-mode`, `--idle-timeout`.
+
 ## Stateful device
 
 The mock keeps live dps state and responds to the full tinytuya client command
