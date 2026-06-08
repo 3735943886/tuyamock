@@ -2,7 +2,6 @@
 
 [![CI](https://github.com/3735943886/tuyamock/actions/workflows/ci.yml/badge.svg)](https://github.com/3735943886/tuyamock/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/tuyamock.svg)](https://pypi.org/project/tuyamock/)
-[![Python versions](https://img.shields.io/pypi/pyversions/tuyamock.svg)](https://pypi.org/project/tuyamock/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 A protocol-faithful **mock of a Tuya local-protocol device**, built on
