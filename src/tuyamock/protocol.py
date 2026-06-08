@@ -114,8 +114,25 @@ class VersionProfile:
         payload = self._decrypt_payload(session, msg.cmd, msg.payload)
         return msg._replace(payload=payload)
 
-    def pack_response(self, session, cmd, wire_payload):
-        """Frame already-encoded ``wire_payload`` bytes into a device->client packet."""
+    def response_seqno(self, session):
+        """Seqno for a *command response*.
+
+        TINYTUYA-COUPLING (Layer 2): tinytuya's _get_retcode requires the response
+        seqno to EQUAL the request seqno for version < 3.5 (only v3.5 uses a global
+        incrementing seqno). So 55AA profiles echo the request seqno; V35 overrides
+        this to use the device's own counter. Getting this wrong does not break
+        dps decoding but silently leaves cmd_retcode unset on v3.1-3.4.
+        """
+        return session.req_seqno
+
+    def pack_response(self, session, cmd, wire_payload, seqno=None):
+        """Frame already-encoded ``wire_payload`` bytes into a device->client packet.
+
+        ``seqno`` defaults to :meth:`response_seqno` (a command reply); device
+        initiated pushes pass an explicit global seqno instead.
+        """
+        if seqno is None:
+            seqno = self.response_seqno(session)
         # TINYTUYA-COUPLING (Layer 2: TuyaMessage field order + retcode asymmetry).
         # TuyaMessage is built POSITIONALLY as
         # (seqno, cmd, retcode, payload, crc, crc_good, prefix, iv); last field is
@@ -125,14 +142,13 @@ class VersionProfile:
         # serialize wrong silently.
         if self.prefix == H.PREFIX_6699_VALUE:
             msg = TuyaMessage(
-                session.seqno, cmd, 0, wire_payload, 0, True, self.prefix, True
+                seqno, cmd, 0, wire_payload, 0, True, self.prefix, True
             )
         else:
             # 55AA device->client messages carry a 4-byte retcode the client strips.
             msg = TuyaMessage(
-                session.seqno, cmd, 0, RETCODE + wire_payload, 0, True, self.prefix, None
+                seqno, cmd, 0, RETCODE + wire_payload, 0, True, self.prefix, None
             )
-        session.seqno += 1
         # TINYTUYA-COUPLING (Layer 2): hmac_key=None => CRC32 framing, bytes => HMAC framing.
         return pack_message(msg, hmac_key=self.framing_key(session))
 
@@ -210,6 +226,10 @@ class V35Profile(VersionProfile):
 
     def framing_key(self, session):
         return session.key
+
+    def response_seqno(self, session):
+        # v3.5 devices reply with a global incrementing seqno, not the request's.
+        return session.next_global_seqno()
 
     def _decrypt_payload(self, session, cmd, payload):
         # 6699 framing already GCM-decrypted the inner payload.
