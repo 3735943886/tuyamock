@@ -345,36 +345,3 @@ The standard status query differs by version (`DP_QUERY` on v3.1–3.3,
   to it serially (a fresh connection per command). Adding multi-client support
   would make the mock behave *unlike* real hardware — don't.
 * **`cli.py`** — the `python -m tuyamock` entry point.
-
-## Tests
-
-```bash
-pytest -v
-```
-
-`tests/test_with_tinytuya.py` runs the stage-1 bootstrap across every supported
-version plus the device22 quirk, custom-dps injection, `--port 0`, wrong-key
-rejection, parallel isolation, and clean shutdown.
-`tests/test_inprocess.py` adds the `MockDevice` API tests and a single-CPU-pinned
-reconnect stress test.
-
-CI (`.github/workflows/ci.yml`) runs the suite on Python 3.8–3.12 for every push
-and pull request.
-
-## Releasing (PyPI)
-
-Publishing is automated by `.github/workflows/publish.yml` via PyPI
-[Trusted Publishing](https://docs.pypi.org/trusted-publishers/) (OIDC — no API
-token stored). To cut a release:
-
-1. Bump the version — single source: `__version__` in
-   `src/tuyamock/__init__.py` (pyproject reads it via `dynamic = ["version"]`) —
-   and commit.
-2. Tag and push, e.g. `git tag v0.0.1 && git push origin v0.0.1`.
-3. Create a GitHub Release for that tag. Publishing the release triggers the
-   workflow: it runs the tests, builds the sdist + wheel, `twine check`s them, and
-   uploads to PyPI.
-
-One-time setup: on PyPI add a trusted publisher for the project (`tuyamock`)
-pointing at this repo, `publish.yml`, environment `pypi`. (Prefer a token? Replace
-the OIDC step with `with: password: ${{ secrets.PYPI_API_TOKEN }}`.)
