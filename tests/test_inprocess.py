@@ -7,6 +7,8 @@ reject -> reconnect mechanism.
 
 import contextlib
 import os
+import resource
+import socket
 
 import pytest
 import tinytuya
@@ -87,6 +89,82 @@ def test_rapid_reconnect_stress(version):
 def test_mockdevice_reports_bound_port():
     with tuyamock.MockDevice(local_key=KEY, version="3.5", port=0) as mock:
         assert 1024 <= mock.port <= 65535
+
+
+def test_fleet_scales_past_fd_1024():
+    """A fleet of mocks in one process, each with a live v3.4 handshake, must all
+    work even though their socket fds climb well past 1024. This is the at-scale
+    guard for the select(2) FD_SETSIZE bug (a select()-based loop silently killed
+    the serve thread of any instance landing on a high fd). Each mock carries a
+    unique dp, so a correct reply proves the client reached the right device.
+
+    256 is enough to push fds past 1024 without the cost of a 1000-OS-thread
+    fleet (that scales fine too — teardown is O(1) via the wake pipe — but in one
+    process it is a thread-per-mock pattern; real fleets use separate processes).
+    Raises its own fd soft limit (CI often defaults to 1024); skips if the hard
+    limit cannot accommodate it. Override the size with TUYAMOCK_FLEET_N."""
+    n = int(os.environ.get("TUYAMOCK_FLEET_N", "256"))
+    need = 6 * n + 256  # listen + wake-pair + accepted + client-side, with slack
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if hard != resource.RLIM_INFINITY and hard < need:
+        pytest.skip("RLIMIT_NOFILE hard=%d < %d needed for a fleet of %d" % (hard, need, n))
+    if soft != resource.RLIM_INFINITY and soft < need:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (need, hard))
+
+    mocks, clients = [], []
+    try:
+        for i in range(n):
+            # idle_timeout=0 keeps every connection open so the fds accumulate.
+            m = tuyamock.MockDevice(local_key=KEY, version="3.4",
+                                    dps={"1": True, "n": i}, idle_timeout=0)
+            m.start()
+            mocks.append(m)
+            d = tinytuya.Device(DEV_ID, "127.0.0.1", KEY, version=3.4, port=m.port,
+                                persist=True, connection_retry_limit=1,
+                                connection_retry_delay=1)
+            d.set_socketTimeout(3)
+            clients.append(d)
+            status = d.status()
+            assert isinstance(status, dict) and status.get("dps", {}).get("n") == i, (
+                "mock #%d handshake/status failed: %r" % (i, status))
+
+        # We genuinely crossed the fd 1024 boundary and no serve thread died.
+        assert max(m.server._srv.fileno() for m in mocks) >= 1024
+        assert all(m._thread.is_alive() for m in mocks)
+    finally:
+        for d in clients:
+            with contextlib.suppress(Exception):
+                d.close()
+        for m in mocks:
+            with contextlib.suppress(Exception):
+                m.stop()
+
+
+def test_high_fd_socket_does_not_break_serve_loop():
+    """A mock whose sockets land at fd >= 1024 must still work, including the v3.4
+    handshake. select(2) cannot watch an fd >= FD_SETSIZE (1024) and raises
+    ValueError, which silently killed the serve thread; the loop uses selectors
+    (epoll/kqueue) instead. With a few hundred mocks in one process the fds climb
+    past 1024, so this guards that whole regime. Skipped where the fd ceiling is
+    too low to even reach fd 1024 (e.g. a constrained CI ulimit)."""
+    soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft < 1100:
+        pytest.skip("RLIMIT_NOFILE=%d too low to push fds past 1024" % soft)
+
+    pad = []
+    try:
+        while not pad or pad[-1].fileno() < 1030:
+            pad.append(socket.socket(socket.AF_INET, socket.SOCK_STREAM))
+        with tuyamock.MockDevice(local_key=KEY, version="3.4", dps={"1": True}) as mock:
+            assert mock.server._srv.fileno() >= 1024  # listen socket is high
+            d = client(mock.port, "3.4")
+            assert d.status()["dps"]["1"] is True       # handshake survived
+            d.set_value("1", False)
+            assert mock.dps["1"] is False
+            assert mock._thread.is_alive()              # serve thread did not die
+    finally:
+        for s in pad:
+            s.close()
 
 
 @pytest.mark.parametrize("version", ["3.3", "3.4"])

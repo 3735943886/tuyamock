@@ -1,7 +1,7 @@
 """TCP server loop that drives :class:`TuyaMockDevice` over a real socket."""
 
 import logging
-import select
+import selectors
 import socket
 import threading
 
@@ -55,6 +55,11 @@ class TuyaMockServer:
         self._io_lock = threading.Lock()
         self._client = None
         self._session = None
+        # Self-pipe so close() can wake the serve loop instantly from another
+        # thread (rather than waiting out the select timeout). Without this, tearing
+        # down a fleet of N mocks costs ~N seconds. Created in start().
+        self._wake_r = None
+        self._wake_w = None
 
     # -- lifecycle --------------------------------------------------------
 
@@ -68,6 +73,9 @@ class TuyaMockServer:
         srv.listen(8)
         self._srv = srv
         self.port = srv.getsockname()[1]
+        # Wakeup pipe (a socketpair, which the selector can watch portably).
+        self._wake_r, self._wake_w = socket.socketpair()
+        self._wake_r.setblocking(False)
         if self.discovery:
             self._udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self._udp.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -83,6 +91,16 @@ class TuyaMockServer:
         if self._closed:
             return
         self._closed = True
+        # Wake the serve loop immediately so its thread exits without waiting out
+        # the select timeout (fast fleet teardown). We only SEND here; the wake
+        # sockets are closed by serve_forever's finally, so the byte stays readable
+        # until the loop drains it (closing _wake_r here would race the read and,
+        # with an indefinite timeout, hang the thread).
+        if self._wake_w is not None:
+            try:
+                self._wake_w.send(b"x")
+            except OSError:
+                pass
         for sock in (self._srv, self._udp):
             if sock is not None:
                 try:
@@ -124,26 +142,76 @@ class TuyaMockServer:
 
         Returns the number of connections fully handled.  Designed to be run in
         the main thread so SIGINT/SIGTERM (raised as KeyboardInterrupt by the
-        CLI's signal handler) cleanly unwinds out of ``select``.
+        CLI's signal handler) cleanly unwinds out of the event wait.
+
+        Uses ``selectors`` (epoll/kqueue), NOT ``select.select()``, on purpose:
+        select(2) cannot watch a socket whose fd number is >= 1024 (FD_SETSIZE)
+        and raises ValueError. With a few hundred mock instances in one process
+        the fd numbers climb past 1024, so a select()-based loop silently dies for
+        every instance whose socket lands on a high fd (confirmed: a v3.4 mock at
+        fd 1023 loses its handshake and its serve thread exits). epoll/kqueue have
+        no such limit.
         """
         import time
 
+        sel = selectors.DefaultSelector()
+        sel.register(self._srv, selectors.EVENT_READ)
+        sel.register(self._wake_r, selectors.EVENT_READ)
+
         served = 0
         client = None
-        buffer = b""
         session = None
-        last_rx = 0.0  # time of last inbound packet, for the idle timeout
+        buffer = b""
+        last_rx = 0.0          # time of last inbound packet, for the idle timeout
+        client_registered = False
+
+        def drop_client():
+            nonlocal client, session, buffer, client_registered
+            if client is None:
+                return
+            if client_registered:
+                try:
+                    sel.unregister(client)
+                except (KeyError, ValueError, OSError):
+                    pass
+                client_registered = False
+            try:
+                client.close()
+            except OSError:
+                pass
+            client = None
+            session = None
+            buffer = b""
+            self._set_current(None, None)
+
         try:
             while not self._closed:
-                rlist = [self._srv]
-                if client is not None:
-                    rlist.append(client)
+                # Sleep until something actually happens. close() wakes us via the
+                # self-pipe, new connections wake us via the listen socket; we only
+                # need a timeout for the time-based work (idle expiry, discovery),
+                # so an otherwise-idle mock costs no CPU even in a fleet of 1000s.
+                if self.discovery:
+                    timeout = 1.0
+                elif client is not None and self.idle_timeout:
+                    timeout = max(0.05, self.idle_timeout - (time.time() - last_rx))
+                else:
+                    timeout = None
                 try:
-                    readable, _, _ = select.select(rlist, [], [], 1.0)
+                    events = sel.select(timeout)
                 except (OSError, ValueError):
-                    # A socket was closed under us (e.g. close() called from
+                    # A registered socket was closed under us (e.g. close() from
                     # another thread to stop a background server).
                     break
+                ready = {key.fileobj for key, _ in events}
+
+                if self._wake_r in ready:
+                    # close() poked us; drain and let the while-condition exit.
+                    try:
+                        self._wake_r.recv(4096)
+                    except OSError:
+                        pass
+                    if self._closed:
+                        break
 
                 now = time.time()
                 self._maybe_broadcast(now)
@@ -153,9 +221,7 @@ class TuyaMockServer:
                 if (client is not None and self.idle_timeout
                         and now - last_rx > self.idle_timeout):
                     log.info("client idle for >%.0fs, closing", self.idle_timeout)
-                    client.close()
-                    client, session = None, None
-                    self._set_current(None, None)
+                    drop_client()
                     served += 1
                     if max_connections is not None and served >= max_connections:
                         return served
@@ -165,22 +231,17 @@ class TuyaMockServer:
                 # new connection. Tuya clients are non-persistent (a fresh connection
                 # per command), so one can close a connection and open the next so
                 # fast that the old socket's EOF and the new SYN land in the *same*
-                # select wake-up. If we accepted first, the subsequent EOF handler
-                # would run against the just-reassigned `client` and close the
-                # brand-new socket, killing it before its handshake is read. We also
-                # operate on the specific socket, not the mutable `client`, to keep
-                # the two connections from being confused.
-                if client is not None and client in readable:
+                # wake-up. If we accepted first, the subsequent EOF handler would run
+                # against the just-reassigned `client` and close the brand-new
+                # socket, killing it before its handshake is read.
+                if client is not None and client in ready:
                     try:
                         data = client.recv(4096)
                     except (ConnectionResetError, OSError):
                         data = b""
 
                     if not data:
-                        client.close()
-                        client = None
-                        session = None
-                        self._set_current(None, None)
+                        drop_client()
                         served += 1
                         log.info("client disconnected (%d served)", served)
                         if max_connections is not None and served >= max_connections:
@@ -192,7 +253,7 @@ class TuyaMockServer:
                         for frame in frames:
                             self._handle_frame(client, session, frame)
 
-                if self._srv in readable and not self._closed:
+                if self._srv in ready and not self._closed:
                     try:
                         new_client, addr = self._srv.accept()
                     except OSError:
@@ -201,13 +262,15 @@ class TuyaMockServer:
                     if client is not None:
                         # Previous client never sent EOF (abnormal for a synchronous
                         # client); replace it.
-                        client.close()
+                        drop_client()
                     client = new_client
                     # A send timeout keeps a non-reading client (which never drains
                     # our responses) from blocking the loop forever in sendall; the
                     # blocked send raises and we drop the connection. recv is guarded
-                    # by select() so it never hits this.
+                    # by the selector so it never hits this.
                     client.settimeout(self.idle_timeout or None)
+                    sel.register(client, selectors.EVENT_READ)
+                    client_registered = True
                     buffer = b""
                     session = self.device.new_session()
                     last_rx = now
@@ -217,12 +280,11 @@ class TuyaMockServer:
         except KeyboardInterrupt:
             log.info("interrupted, shutting down")
         finally:
-            if client is not None:
-                try:
-                    client.close()
-                except OSError:
-                    pass
-            self._set_current(None, None)
+            drop_client()
+            try:
+                sel.close()
+            except Exception:  # noqa: BLE001 - best-effort cleanup
+                pass
             self.close()
         return served
 
