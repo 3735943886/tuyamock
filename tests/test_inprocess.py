@@ -6,12 +6,16 @@ reject -> reconnect mechanism.
 """
 
 import contextlib
+import json
 import os
 import resource
 import socket
 
 import pytest
 import tinytuya
+from tinytuya.core import command_types as CT
+from tinytuya.core import header as H
+from tinytuya.core.message_helper import TuyaMessage, pack_message
 
 import tuyamock
 
@@ -190,3 +194,71 @@ def test_device22_reject_then_reconnect(version):
         # Normal operation continues afterwards.
         d.set_value("1", True)
         assert mock.dps["1"] is True
+
+
+# -- UDP discovery: passive beacon + active probe reply, all versions ---------
+#
+# Both paths are validated against tinytuya's OWN decoder (`decrypt_udp`, the exact
+# function its scanner runs on every received packet), so a green test means a real
+# `tinytuya scan`/`deviceScan` would decode the mock. (Full end-to-end deviceScan
+# discovery for all five versions has also been verified manually; it is kept out
+# of CI because it broadcasts and takes ~10s/version.)
+
+def _reuse_udp_socket():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if hasattr(socket, "SO_REUSEPORT"):
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    return s
+
+
+@pytest.mark.parametrize("version", ALL_VERSIONS)
+def test_discovery_beacon_decodable_by_tinytuya(version):
+    """The passive beacon decodes via tinytuya.decrypt_udp at the right version."""
+    rx = _reuse_udp_socket()
+    rx.bind(("127.0.0.1", tuyamock.server.DISCOVERY_BEACON_PORT))  # 6667
+    rx.settimeout(12)
+    try:
+        # Bind the listener BEFORE the mock so the immediate first beacon isn't lost.
+        with tuyamock.MockDevice(local_key=KEY, version=version, dps={"1": True},
+                                 discovery=True, discovery_addr="127.0.0.1"):
+            data, _ = rx.recvfrom(4048)
+    finally:
+        rx.close()
+    info = json.loads(tinytuya.decrypt_udp(data))
+    assert info["version"] == version
+    assert info["gwId"] == DEV_ID
+
+
+@pytest.mark.parametrize("version", ALL_VERSIONS)
+def test_active_probe_reply_decodable_by_tinytuya(version):
+    """Every version answers a real REQ_DEVINFO probe with a decodable reply.
+
+    The reply is directed (via the probe's ``ip`` field) to a listener on a distinct
+    loopback IP so a specific-address bind wins delivery over the mock's wildcard
+    7000 socket (no SO_REUSEPORT load-balance steal).
+    """
+    app_ip = "127.0.0.9"
+    rx = _reuse_udp_socket()
+    rx.bind((app_ip, tuyamock.server.DISCOVERY_PROBE_PORT))  # (127.0.0.9, 7000)
+    rx.settimeout(5)
+    probe = pack_message(
+        TuyaMessage(0, CT.REQ_DEVINFO, None,
+                    json.dumps({"from": "app", "ip": app_ip}).encode(),
+                    0, True, H.PREFIX_6699_VALUE, True),
+        hmac_key=tinytuya.udpkey,
+    )
+    try:
+        with tuyamock.MockDevice(local_key=KEY, version=version, dps={"1": True},
+                                 discovery=True, probe_reply=True) as mock:
+            if not mock.server._udp_listening:
+                pytest.skip("could not bind UDP probe port 7000")
+            tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            tx.sendto(probe, ("127.0.0.1", tuyamock.server.DISCOVERY_PROBE_PORT))
+            tx.close()
+            data, _ = rx.recvfrom(4048)
+    finally:
+        rx.close()
+    info = json.loads(tinytuya.decrypt_udp(data))
+    assert info["version"] == version
+    assert info["gwId"] == DEV_ID

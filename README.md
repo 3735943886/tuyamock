@@ -48,13 +48,13 @@ modules (`tinytuya.core.*`), not a documented/stable public API:
 |-----------------|-------------|---------|------|
 | `pack_message` | `tinytuya.core.message_helper` | `protocol.py` (`VersionProfile.pack_response`), `server.py` (discovery beacon) | assemble 55AA / 6699 frames |
 | `unpack_message` | `tinytuya.core.message_helper` | `protocol.py` (`VersionProfile.unpack_request`) | disassemble one frame → `TuyaMessage` |
-| `TuyaMessage` | `tinytuya.core.message_helper` | `protocol.py` (`pack_response`), `server.py` (`_maybe_broadcast`) | 8-field namedtuple passed to `pack_message` |
+| `TuyaMessage` | `tinytuya.core.message_helper` | `protocol.py` (`pack_response`), `server.py` (`_device_info_packet`) | 8-field namedtuple passed to `pack_message` |
 | `parse_header` | `tinytuya.core.message_helper` | `device.py` (`take_frames`) | read `total_length` for stream framing |
 | `AESCipher` | `tinytuya.core.crypto_helper` | `protocol.py` (the crypto-utility wrappers) | AES-ECB / AES-GCM + PKCS#7 padding |
 | `command_types` (`CT`) | `tinytuya.core` | protocol/device/server | command opcode *values* |
 | `header` (`H`) | `tinytuya.core` | protocol/server | prefix/header/version-byte constants |
 | `DecodeError` | `tinytuya.core.exceptions` | device/server | raised on short/garbled frames |
-| `tinytuya.udpkey` | `tinytuya` (top level) | `server.py` (`_maybe_broadcast`) | HMAC key for the UDP discovery beacon |
+| `tinytuya.udpkey` | `tinytuya` (top level) | `server.py` (`_device_info_packet`) | HMAC key for the UDP discovery beacon |
 
 Constants we read out of `H`: `PREFIX_55AA_VALUE`, `PREFIX_6699_VALUE`,
 `PROTOCOL_3x_HEADER`, `PROTOCOL_VERSION_BYTES_31`. Opcodes we read out of `CT`:
@@ -71,7 +71,7 @@ Enumerated so a reviewer knows exactly what to re-verify against tinytuya source
 
 * **`TuyaMessage` field order/semantics.** We construct it positionally as
   `TuyaMessage(seqno, cmd, retcode, payload, crc, crc_good, prefix, iv)` in
-  `protocol.py` `pack_response` (and `server.py` `_maybe_broadcast`). The last field
+  `protocol.py` `pack_response` (and `server.py` `_device_info_packet`). The last field
   doubles as the GCM-iv/flag: `True` for 6699, `None` for 55AA. If tinytuya
   reorders or repurposes any field, frames serialize wrong with no error.
 * **`pack_message(msg, hmac_key=…)`** — we rely on `hmac_key=None` ⇒ CRC32 framing
@@ -201,7 +201,8 @@ The first line on **stdout** is always the bound TCP port (handy with
 | `--port` | TCP port (`0` = OS-assigned, printed to stdout) |
 | `--dps` | canned data points as a JSON object |
 | `--dev22` | emulate device22 (only valid on v3.2–v3.4; see below) |
-| `--discovery` | periodically emit the UDP discovery beacon |
+| `--discovery` | be discoverable by `tinytuya scan` — passive beacon + active probe reply (see below) |
+| `--no-probe-reply` | with `--discovery`, passive beacon only (don't bind UDP 7000) |
 | `--max-connections N` | exit cleanly after N client connections (test isolation) |
 
 ## In-process (Python API)
@@ -300,6 +301,34 @@ d = tinytuya.Device("eb0123456789abcdefghij", "127.0.0.1",
 d.set_value("1", True)          # -> {"dps": {"1": True}}
 d.status()["dps"]["1"]          # -> True   (persisted)
 ```
+
+## Discovery (`tinytuya scan`)
+
+With `--discovery` (CLI) or `MockDevice(discovery=True)` the mock is found by a real
+`tinytuya scan` / `tinytuya.deviceScan()` for **every version (v3.1–v3.5)**, via the
+two mechanisms a real device uses — both framed exactly like a real device announce
+(6699 + `tinytuya.udpkey`), so the scanner's own `decrypt_udp` decodes them:
+
+* **Passive beacon** — every ~8 s the mock broadcasts its device-info JSON to UDP
+  `6667`, which the scanner picks up by listening. The device's protocol version
+  rides in the JSON's `version` field, so one packet shape serves all five.
+* **Active probe reply** — the scanner also broadcasts a `REQ_DEVINFO` (0x25) probe
+  to UDP `7000`; the mock binds `7000` and answers with its device-info. On by
+  default; pass `--no-probe-reply` (or `probe_reply=False`) to skip the `7000` bind.
+
+```bash
+python -m tuyamock --version 3.5 --local-key thisisarealkey00 --discovery &
+tinytuya scan          # lists the mock as a v3.5 device at 127.0.0.1
+```
+
+[`examples/scan_demo.py`](examples/scan_demo.py) starts one mock per version on its
+own loopback IP and shows a real `tinytuya.deviceScan()` discovering all five.
+
+The mock binds `7000` with `SO_REUSEPORT` — the same option the tinytuya scanner
+sets on its own `7000` listener — so a scanner and the mock **coexist on one host**.
+(One caveat of same-host use: a unicast probe reply to `7000` may be load-balanced
+to either listener, but the passive beacon makes discovery reliable regardless. On a
+real LAN, device and app are on separate hosts, so there is no overlap at all.)
 
 ## Supported protocol versions
 

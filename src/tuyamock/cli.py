@@ -62,11 +62,17 @@ def build_parser():
     )
     p.add_argument(
         "--discovery", action="store_true",
-        help="Periodically emit the UDP discovery beacon (off by default).",
+        help="Be discoverable by 'tinytuya scan': emit the periodic UDP beacon and "
+             "answer active REQ_DEVINFO probes on port 7000 (off by default).",
     )
     p.add_argument(
         "--discovery-addr", default="127.0.0.1",
         help="Address used in/for the discovery beacon (default: 127.0.0.1).",
+    )
+    p.add_argument(
+        "--no-probe-reply", dest="probe_reply", action="store_false",
+        help="With --discovery, do NOT bind UDP 7000 to answer the scanner's "
+             "active REQ_DEVINFO probes (passive beacon only).",
     )
     p.add_argument(
         "--seqno-mode", default="faithful", choices=list(SEQNO_MODES),
@@ -122,6 +128,7 @@ def main(argv=None):
         discovery=args.discovery,
         discovery_addr=args.discovery_addr,
         idle_timeout=args.idle_timeout,
+        probe_reply=args.probe_reply,
     )
 
     # Translate SIGTERM into KeyboardInterrupt so serve_forever() unwinds the

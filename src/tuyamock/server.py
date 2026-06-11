@@ -1,5 +1,6 @@
 """TCP server loop that drives :class:`TuyaMockDevice` over a real socket."""
 
+import json
 import logging
 import selectors
 import socket
@@ -10,13 +11,20 @@ import threading
 from tinytuya.core import command_types as CT
 from tinytuya.core import header as H
 from tinytuya.core.exceptions import DecodeError
-from tinytuya.core.message_helper import TuyaMessage, pack_message
+from tinytuya.core.message_helper import TuyaMessage, pack_message, unpack_message
 
 import tinytuya
 
 from .device import DeviceConfig, TuyaMockDevice, take_frames
 
 log = logging.getLogger(__name__)
+
+# UDP discovery ports a real tinytuya scanner uses (tinytuya.core.const):
+#   6667 (UDPPORTS)   — encrypted passive announce; we emit periodic beacons here.
+#   7000 (UDPPORTAPP) — the app broadcasts REQ_DEVINFO here for v3.5 devices to
+#                       answer; we bind it to reply to those active probes.
+DISCOVERY_BEACON_PORT = 6667
+DISCOVERY_PROBE_PORT = 7000
 
 
 class TuyaMockServer:
@@ -36,18 +44,26 @@ class TuyaMockServer:
     """
 
     def __init__(self, config, host="127.0.0.1", port=6668, discovery=False,
-                 discovery_addr="127.0.0.1", idle_timeout=30.0):
+                 discovery_addr="127.0.0.1", idle_timeout=30.0, probe_reply=True):
         self.config = config
         self.host = host
         self.port = port
         self.discovery = discovery
         self.discovery_addr = discovery_addr
+        # When discovery is on, also answer the scanner's *active* REQ_DEVINFO
+        # probes on UDP 7000 (not just emit passive beacons) — this is how a real
+        # tinytuya scanner finds v3.5 devices. On by default. We bind 7000 with
+        # SO_REUSEPORT, the same option the tinytuya scanner sets on its own 7000
+        # listener, so a same-host scanner and the mock coexist (verified). Set
+        # False to skip the 7000 bind entirely (passive beacon still works).
+        self.probe_reply = probe_reply
         # Real Tuya devices drop a local TCP connection after ~30s with no inbound
         # packet (this is why clients send heartbeats). Set to 0/None to disable.
         self.idle_timeout = idle_timeout
         self.device = TuyaMockDevice(config)
         self._srv = None
         self._udp = None
+        self._udp_listening = False  # whether _udp is bound to receive probes
         self._bcast_next = 0.0
         self._closed = False
         self.connections = 0  # total client connections accepted (observable)
@@ -79,6 +95,27 @@ class TuyaMockServer:
         if self.discovery:
             self._udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self._udp.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            self._udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if hasattr(socket, "SO_REUSEPORT"):
+                self._udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            # Bind the app discovery port so we can RECEIVE the scanner's active
+            # REQ_DEVINFO probes (all versions answer; see _handle_probe). Only when
+            # probe_reply is on, since holding 7000 conflicts with a same-host
+            # scanner. Best-effort: an unbound socket still sends passive beacons, so
+            # if 7000 is taken we just skip the active path and stay discoverable.
+            if self.probe_reply:
+                try:
+                    # Bind to self.host (not "") so passive beacons are *sourced*
+                    # from this device's IP — the scanner keys discovered devices by
+                    # the packet source address, so distinct hosts (e.g. 127.0.0.1,
+                    # 127.0.0.2, … for a multi-device demo) show up as distinct
+                    # devices. Use "0.0.0.0" as host to receive broadcast probes on a
+                    # real LAN.
+                    self._udp.bind((self.host, DISCOVERY_PROBE_PORT))
+                    self._udp_listening = True
+                except OSError as exc:
+                    log.debug("could not bind UDP probe port %d, active probe reply "
+                              "disabled: %s", DISCOVERY_PROBE_PORT, exc)
         log.info("listening on %s:%d (v%s)", self.host, self.port, self.config.version)
         return self.port
 
@@ -115,25 +152,69 @@ class TuyaMockServer:
     def __exit__(self, *exc):
         self.close()
 
-    # -- discovery beacon -------------------------------------------------
+    # -- discovery (passive beacon + active probe reply) ------------------
 
-    def _maybe_broadcast(self, now):
-        if not self.discovery or self._udp is None or now < self._bcast_next:
-            return
-        self._bcast_next = now + 8
+    def _device_info_packet(self):
+        """Frame this device's discovery JSON the way a real device announces it.
+
+        Always 6699 + ``tinytuya.udpkey`` HMAC, regardless of the device's own
+        protocol version — that is the on-wire form a tinytuya scanner decodes
+        (`decrypt_udp`), and the per-version distinction lives in the ``version``
+        field of the JSON payload, not the UDP framing. So one packet shape serves
+        v3.1-v3.5; the scanner reports each at its advertised version.
+        """
         payload = self.config.discovery_payload(ip=self.discovery_addr)
         # TINYTUYA-COUPLING (Layer 2): positional TuyaMessage build (field order) +
-        # the discovery beacon is HMAC-framed with tinytuya.udpkey. If the well-known
-        # udpkey changes or TuyaMessage's fields reorder, the beacon silently won't be
-        # decodable by a real tinytuya scanner.
+        # HMAC-framed with tinytuya.udpkey. If the well-known udpkey changes or
+        # TuyaMessage's fields reorder, the packet silently stops being decodable by
+        # a real tinytuya scanner.
         msg = TuyaMessage(
             1, CT.UDP_NEW, 0, payload, 0, True, H.PREFIX_6699_VALUE, True
         )
-        data = pack_message(msg, hmac_key=tinytuya.udpkey)
+        return pack_message(msg, hmac_key=tinytuya.udpkey)
+
+    def _maybe_broadcast(self, now):
+        """Emit the periodic passive discovery beacon (every 8s)."""
+        if not self.discovery or self._udp is None or now < self._bcast_next:
+            return
+        self._bcast_next = now + 8
         try:
-            self._udp.sendto(data, (self.discovery_addr, 6667))
+            self._udp.sendto(self._device_info_packet(),
+                             (self.discovery_addr, DISCOVERY_BEACON_PORT))
         except OSError as exc:
             log.debug("discovery broadcast failed: %s", exc)
+
+    def _handle_probe(self):
+        """Answer a scanner's active REQ_DEVINFO probe with this device's info.
+
+        The app broadcasts ``REQ_DEVINFO`` (0x25) to port 7000; a device replies
+        with its discovery JSON. We answer for every version (3.1-3.5): the reply's
+        framing is version-agnostic and the scanner reads the version out of the
+        payload. We reply to the app's IP (taken from the probe's ``ip`` field,
+        falling back to the UDP source) on the app discovery port, where the
+        scanner listens.
+        """
+        try:
+            data, addr = self._udp.recvfrom(4048)
+        except (OSError, ValueError):
+            # Socket closed under us during teardown (fileno() -> -1).
+            return
+        try:
+            msg = unpack_message(data, hmac_key=tinytuya.udpkey, no_retcode=None)
+        except Exception:  # noqa: BLE001 - ignore undecodable/garbage UDP traffic
+            return
+        if msg.cmd != CT.REQ_DEVINFO:
+            return  # not a discovery probe (e.g. another device's announce)
+        app_ip = addr[0]
+        try:
+            app_ip = json.loads(msg.payload.decode()).get("ip") or app_ip
+        except (ValueError, AttributeError):
+            pass
+        try:
+            self._udp.sendto(self._device_info_packet(),
+                             (app_ip, DISCOVERY_PROBE_PORT))
+        except OSError as exc:
+            log.debug("probe reply failed: %s", exc)
 
     # -- main loop --------------------------------------------------------
 
@@ -157,6 +238,8 @@ class TuyaMockServer:
         sel = selectors.DefaultSelector()
         sel.register(self._srv, selectors.EVENT_READ)
         sel.register(self._wake_r, selectors.EVENT_READ)
+        if self._udp is not None and self._udp_listening:
+            sel.register(self._udp, selectors.EVENT_READ)
 
         served = 0
         client = None
@@ -215,6 +298,10 @@ class TuyaMockServer:
 
                 now = time.time()
                 self._maybe_broadcast(now)
+
+                # Answer the scanner's active REQ_DEVINFO probe (all versions).
+                if self._udp is not None and self._udp in ready:
+                    self._handle_probe()
 
                 # Idle timeout: a real device drops the connection if it does not
                 # receive a packet for ~30s (hence client heartbeats).
@@ -360,7 +447,7 @@ class MockDevice:
                  host="127.0.0.1", port=0, gw_id="eb0123456789abcdefghij",
                  product_key="keydeadbeef12345", discovery=False,
                  discovery_addr="127.0.0.1", idle_timeout=30.0,
-                 seqno_mode="faithful"):
+                 seqno_mode="faithful", probe_reply=True):
         self.config = DeviceConfig(
             local_key=local_key, dps=dps, version=version, dev22=dev22,
             gw_id=gw_id, product_key=product_key, seqno_mode=seqno_mode,
@@ -368,7 +455,7 @@ class MockDevice:
         self.server = TuyaMockServer(
             self.config, host=host, port=port,
             discovery=discovery, discovery_addr=discovery_addr,
-            idle_timeout=idle_timeout,
+            idle_timeout=idle_timeout, probe_reply=probe_reply,
         )
         self._thread = None
 
