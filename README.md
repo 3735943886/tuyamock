@@ -150,19 +150,6 @@ is the trap — it neither auto-adapts nor fails loudly.
 > comment (noting its layer). `grep -rn TINYTUYA-COUPLING src/` enumerates exactly
 > what to re-verify against tinytuya on an upgrade.
 
-### Pinned version & upgrade procedure
-
-The dev `.venv` pins tinytuya via an editable install (`pip install -e ../tinytuya`,
-currently **tinytuya 1.18.1**). Treat any tinytuya bump as a deliberate event, not
-a transparent one:
-
-1. Re-run `pytest tests/test_with_tinytuya.py` — the stage-1 bootstrap is the **only**
-   thing that catches Layer-2/Layer-3 silent drift. It exercises every version + the
-   device22 quirk against the real tinytuya client.
-2. If it fails, diff `tinytuya/core/message_helper.py` and `crypto_helper.py` against
-   the Layer-2 contracts above, then re-check the `XenonDevice` policy points (Layer 3).
-3. Only then re-point your client-under-test (stage 2) at the mock.
-
 ## Install
 
 ```bash
