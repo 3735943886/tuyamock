@@ -25,10 +25,6 @@ The intended workflow is a two-step bootstrap:
 2. **mock ⟷ client-under-test** — point the other client at the validated mock.
    Any failure is then isolated to that client, not the harness.
 
-If the mock spoke a re-implemented dialect of the protocol, step 1 would be
-circular and bugs could hide on both sides. Reusing tinytuya's primitives avoids
-that.
-
 ## Dependence on tinytuya (read this before upgrading tinytuya)
 
 The mock does **not** re-implement the Tuya protocol — it **imports tinytuya at
