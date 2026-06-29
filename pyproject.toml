@@ -26,10 +26,14 @@ classifiers = [
     "Topic :: Home Automation",
 ]
 dependencies = [
-    # The mock must reuse tinytuya's own packing/crypto primitives so that it
-    # stays an *independent* oracle: if the mock spoke a re-implemented dialect,
-    # validating another client against it would be circular.
-    "tinytuya>=1.13",
+    # The mock reuses tinytuya's own packing/crypto primitives, so it is coupled to
+    # tinytuya's *internal* modules (see README "Dependence on tinytuya": the wire
+    # framing/handshake/header policy is mirrored by hand at Layers 2-3). Pinned to
+    # an EXACT version, not a floor: a minor/patch bump can silently shift those
+    # internals and break the mock. We follow tinytuya slowly — let a release settle
+    # and prove stable, then bump deliberately (re-run tests/test_with_tinytuya.py).
+    # Never float it.
+    "tinytuya==1.18.1",
 ]
 
 [project.urls]

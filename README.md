@@ -146,6 +146,17 @@ is the trap — it neither auto-adapts nor fails loudly.
 > comment (noting its layer). `grep -rn TINYTUYA-COUPLING src/` enumerates exactly
 > what to re-verify against tinytuya on an upgrade.
 
+### Pinned to tinytuya 1.18.1
+
+Because of that coupling, the dependency is pinned to an **exact** version —
+`tinytuya==1.18.1` in `pyproject.toml` — not a floor. 1.18.1 is a mature, stable
+point in the protocol surface this mock mirrors, so we deliberately built against
+it. The policy is to **follow tinytuya slowly**: we don't track new releases as they
+land — a minor/patch bump can silently shift the internals mirrored above. Let a
+release settle and prove stable, then move the pin up deliberately (re-running
+`tests/test_with_tinytuya.py`). A pinned, known-good baseline is worth more here than
+being current — and it doubles as a fixed reference for differential testing.
+
 ## Install
 
 ```bash
